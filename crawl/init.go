@@ -21,6 +21,26 @@ var (
 // Mutex for safely updating counts
 var StatusMutex sync.Mutex
 
+func IsLocalRelay(relayURL string) bool {
+	parsedURL, err := url.Parse(relayURL)
+	if err != nil {
+		return false
+	}
+	hostname := parsedURL.Hostname()
+	return strings.HasSuffix(hostname, ".local") ||
+		strings.HasPrefix(hostname, "192.168.") ||
+		strings.HasPrefix(hostname, "127.0.0.") ||
+		strings.HasPrefix(hostname, "localhost")
+}
+
+func IsOnionRelay(relayURL string) bool {
+	parsedURL, err := url.Parse(relayURL)
+	if err != nil {
+		return false
+	}
+	return strings.HasSuffix(parsedURL.Hostname(), ".onion")
+}
+
 // Update the status in the terminal
 func UpdateStatus() {
 	StatusMutex.Lock()
@@ -74,7 +94,7 @@ func markRelayOffline(relayURL string) {
 	log.Printf("Relay marked as offline: %s", relayURL)
 }
 
-// Crawl a relay URL with retry logic
+// Initialize Crawling
 func Init(relayURL string, discoveredBy string, maxDepth int) {
 	if maxDepth <= 0 {
 		return

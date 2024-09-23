@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/csv"
-
 	"fmt"
 	"log"
 	"os"
@@ -15,10 +14,12 @@ import (
 	"crawlr/types"
 )
 
-
-const(
-	logFolder     = "logs/"
-	relayLogFile  = logFolder + "relays.csv"
+const (
+	logFolder        = "logs/"
+	onlineRelayFile  = logFolder + "online_relays.csv"
+	offlineRelayFile = logFolder + "offline_relays.csv"
+	localRelayFile   = logFolder + "local_relays.csv"
+	onionRelayFile   = logFolder + "onion_relays.csv"
 )
 
 func initLogging() {
@@ -29,13 +30,10 @@ func initLogging() {
 	}
 }
 
-func writeToCSV() {
-	crawl.RelaysMutex.RLock()
-	defer crawl.RelaysMutex.RUnlock()
-
-	file, err := os.Create(relayLogFile)
+func writeToCSV(filename string, relays []*types.RelayInfo) {
+	file, err := os.Create(filename)
 	if err != nil {
-		log.Printf("Failed to create CSV file: %v", err)
+		log.Printf("Failed to create CSV file %s: %v", filename, err)
 		return
 	}
 	defer file.Close()
@@ -43,25 +41,58 @@ func writeToCSV() {
 	writer := csv.NewWriter(file)
 	defer writer.Flush()
 
-	writer.Write([]string{"Relay URL", "Count", "Discovered By", "Offline"})
+	writer.Write([]string{"Relay URL", "Count", "Discovered By"})
 
-	var relayList []*types.RelayInfo
+	for _, relay := range relays {
+		writer.Write([]string{relay.URL, fmt.Sprintf("%d", relay.Count), relay.DiscoveredBy})
+	}
+
+	log.Printf("Data written to CSV file: %s", filename)
+}
+
+func categorizeRelays() (online, offline, local, onion []*types.RelayInfo) {
+	crawl.RelaysMutex.RLock()
+	defer crawl.RelaysMutex.RUnlock()
+
 	for _, relay := range crawl.Relays {
-		relayList = append(relayList, relay)
+		if crawl.IsLocalRelay(relay.URL) {
+			local = append(local, relay)
+		} else if crawl.IsOnionRelay(relay.URL) {
+			onion = append(onion, relay)
+		} else {
+			crawl.OfflineMutex.RLock()
+			isOffline := crawl.OfflineRelays[relay.URL]
+			crawl.OfflineMutex.RUnlock()
+
+			if isOffline {
+				offline = append(offline, relay)
+			} else {
+				online = append(online, relay)
+			}
+		}
 	}
 
-	sort.Slice(relayList, func(i, j int) bool {
-		return relayList[i].Count > relayList[j].Count
+	return
+}
+
+func sortRelays(relays []*types.RelayInfo) {
+	sort.Slice(relays, func(i, j int) bool {
+		return relays[i].Count > relays[j].Count
 	})
+}
 
-	for _, relay := range relayList {
-		crawl.OfflineMutex.RLock()
-		offline := crawl.OfflineRelays[relay.URL]
-		crawl.OfflineMutex.RUnlock()
-		writer.Write([]string{relay.URL, fmt.Sprintf("%d", relay.Count), relay.DiscoveredBy, fmt.Sprintf("%v", offline)})
-	}
+func writeAllCSVs() {
+	online, offline, local, onion := categorizeRelays()
 
-	log.Println("Data written to CSV file")
+	sortRelays(online)
+	sortRelays(offline)
+	sortRelays(local)
+	sortRelays(onion)
+
+	writeToCSV(onlineRelayFile, online)
+	writeToCSV(offlineRelayFile, offline)
+	writeToCSV(localRelayFile, local)
+	writeToCSV(onionRelayFile, onion)
 }
 
 func allOnlineRelaysCrawled() bool {
@@ -72,98 +103,91 @@ func allOnlineRelaysCrawled() bool {
 	crawl.CrawledMutex.RLock()
 	defer crawl.CrawledMutex.RUnlock()
 
-	return crawl.RemainingRelaysCount == 0
+	for url := range crawl.Relays {
+		if !crawl.OfflineRelays[url] && !crawl.CrawledRelays[url] {
+			return false
+		}
+	}
+	return true
 }
 
+func readOnlineRelaysFromCSV() []string {
+	file, err := os.Open(onlineRelayFile)
+	if err != nil {
+		log.Printf("Could not open CSV file: %v", err)
+		return nil
+	}
+	defer file.Close()
 
-func readRelaysFromCSV() []string {
-    file, err := os.Open(relayLogFile)
-    if err != nil {
-        log.Printf("Could not open CSV file: %v", err)
-        return nil
-    }
-    defer file.Close()
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		log.Printf("Could not read CSV file: %v", err)
+		return nil
+	}
 
-    reader := csv.NewReader(file)
-    records, err := reader.ReadAll()
-    if err != nil {
-        log.Printf("Could not read CSV file: %v", err)
-        return nil
-    }
-
-    var onlineRelays []string
-    for _, record := range records[1:] { // Skip header
-        if len(record) > 0 {
-            relayURL := record[0]
-
-            // Check if the relay is offline
-            crawl.OfflineMutex.RLock()
-            offline := crawl.OfflineRelays[relayURL]
-            crawl.OfflineMutex.RUnlock()
-
-            // Only add online relays
-            if !offline {
-                onlineRelays = append(onlineRelays, relayURL)
-            }
-        }
-    }
-    return onlineRelays
+	var onlineRelays []string
+	for _, record := range records[1:] { // Skip header
+		if len(record) > 0 {
+			onlineRelays = append(onlineRelays, record[0])
+		}
+	}
+	return onlineRelays
 }
-
 
 func main() {
-    initLogging()
+	initLogging()
 
-    var wg sync.WaitGroup
-    crawlComplete := make(chan struct{})
+	var wg sync.WaitGroup
+	crawlComplete := make(chan struct{})
 
-    // Read only online relays from CSV
-    relaysFromCSV := readRelaysFromCSV()
-    if len(relaysFromCSV) > 0 {
-        log.Println("Starting crawl from online relays in CSV...")
-        for _, relay := range relaysFromCSV {
-            wg.Add(1)
-            go func(r string) {
-                defer wg.Done()
-                crawl.Init(r, r, 3)
-            }(relay)
-        }
-    } else {
-        // If no online relays in CSV, start from a default relay
-        startingRelay := "wss://nos.lol"
-        log.Println("No online relays found in CSV. Starting from:", startingRelay)
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            crawl.Init(startingRelay, "starting-point", 3)
-        }()
-    }
+	// Read online relays from CSV
+	onlineRelays := readOnlineRelaysFromCSV()
+	if len(onlineRelays) > 0 {
+		log.Println("Starting crawl from online relays in CSV...")
+		for _, relay := range onlineRelays {
+			wg.Add(1)
+			go func(r string) {
+				defer wg.Done()
+				crawl.Init(r, r, 3)
+			}(relay)
+		}
+	} else {
+		// If no online relays in CSV, start from a default relay
+		startingRelay := "wss://nos.lol"
+		log.Println("No online relays found in CSV. Starting from:", startingRelay)
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			crawl.Init(startingRelay, "starting-point", 3)
+		}()
+	}
 
-    // Wait for all crawls to complete
-    go func() {
-        wg.Wait()
-        for {
-            if allOnlineRelaysCrawled() {
-                close(crawlComplete)
-                return
-            }
-            time.Sleep(1 * time.Second)
-        }
-    }()
+	// Wait for all crawls to complete
+	go func() {
+		wg.Wait()
+		for {
+			if allOnlineRelaysCrawled() {
+				close(crawlComplete)
+				return
+			}
+			time.Sleep(1 * time.Second)
+		}
+	}()
 
-    // Handle interrupt signal (Ctrl+C)
-    interrupt := make(chan os.Signal, 1)
-    signal.Notify(interrupt, os.Interrupt)
+	// Handle interrupt signal (Ctrl+C)
+	interrupt := make(chan os.Signal, 1)
+	signal.Notify(interrupt, os.Interrupt)
 
-    select {
-    case <-crawlComplete:
-        log.Println("Crawl complete. All online relays have been contacted.")
-    case <-interrupt:
-        log.Println("Received interrupt signal.")
-    }
+	select {
+	case <-crawlComplete:
+		log.Println("Crawl complete. All online relays have been contacted.")
+	case <-interrupt:
+		log.Println("Received interrupt signal.")
+	}
 
-    // Write the final results to CSV
-    log.Println("Writing final results to CSV...")
-    writeToCSV()
-    log.Println("Final results written to", relayLogFile)
+	// Write the final results to CSV files
+	log.Println("Writing final results to CSV files...")
+	writeAllCSVs()
+	log.Println("Final results written to CSV files in", logFolder)
 }
