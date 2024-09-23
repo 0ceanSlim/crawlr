@@ -1,3 +1,4 @@
+// miain.go
 package main
 
 import (
@@ -60,14 +61,14 @@ func categorizeRelays() (online, offline, local, onion []*types.RelayInfo) {
 		} else if crawl.IsOnionRelay(relay.URL) {
 			onion = append(onion, relay)
 		} else {
-			crawl.OfflineMutex.RLock()
-			isOffline := crawl.OfflineRelays[relay.URL]
-			crawl.OfflineMutex.RUnlock()
+			crawl.CrawledMutex.RLock()
+			isCrawled := crawl.CrawledRelays[relay.URL]
+			crawl.CrawledMutex.RUnlock()
 
-			if isOffline {
-				offline = append(offline, relay)
-			} else {
+			if isCrawled {
 				online = append(online, relay)
+			} else {
+				offline = append(offline, relay)
 			}
 		}
 	}
@@ -135,37 +136,40 @@ func readOnlineRelaysFromCSV() []string {
 	return onlineRelays
 }
 
+func startCrawling(relays []string) {
+	var wg sync.WaitGroup
+	for _, relay := range relays {
+		wg.Add(1)
+		go func(r string) {
+			defer wg.Done()
+			crawl.Init(r, r, 3)
+		}(relay)
+	}
+	wg.Wait()
+}
+
 func main() {
+
+	crawl.ResetRelayData()
+
 	initLogging()
 
-	var wg sync.WaitGroup
 	crawlComplete := make(chan struct{})
 
 	// Read online relays from CSV
 	onlineRelays := readOnlineRelaysFromCSV()
 	if len(onlineRelays) > 0 {
 		log.Println("Starting crawl from online relays in CSV...")
-		for _, relay := range onlineRelays {
-			wg.Add(1)
-			go func(r string) {
-				defer wg.Done()
-				crawl.Init(r, r, 3)
-			}(relay)
-		}
+		startCrawling(onlineRelays)
 	} else {
 		// If no online relays in CSV, start from a default relay
 		startingRelay := "wss://nos.lol"
 		log.Println("No online relays found in CSV. Starting from:", startingRelay)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			crawl.Init(startingRelay, "starting-point", 3)
-		}()
+		startCrawling([]string{startingRelay})
 	}
 
-	// Wait for all crawls to complete
+	// Continuation Logic: Wait for crawl to complete
 	go func() {
-		wg.Wait()
 		for {
 			if allOnlineRelaysCrawled() {
 				close(crawlComplete)

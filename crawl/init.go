@@ -18,8 +18,49 @@ var (
 	RemainingRelaysCount int
 )
 
-// Mutex for safely updating counts
-var StatusMutex sync.Mutex
+// Mutex for safely updating counts and relays
+var (
+	StatusMutex    sync.Mutex
+	RelaysMutex    sync.RWMutex
+	CrawledMutex   sync.RWMutex
+	OfflineMutex   sync.RWMutex
+)
+
+// Relay storage
+var (
+	Relays        = make(map[string]*types.RelayInfo) // Stores all relays discovered
+	CrawledRelays = make(map[string]bool)             // Tracks which relays have been crawled
+	OfflineRelays = make(map[string]bool)             // Tracks which relays are offline
+)
+
+const (
+	maxRetries = 1
+	retryDelay = 2 * time.Second
+	timeout    = 2 * time.Second
+)
+
+// Clear all relay data at the start of the program to avoid stale data
+func ResetRelayData() {
+    RelaysMutex.Lock()
+    defer RelaysMutex.Unlock()
+
+    CrawledMutex.Lock()
+    defer CrawledMutex.Unlock()
+
+    OfflineMutex.Lock()
+    defer OfflineMutex.Unlock()
+
+    Relays = make(map[string]*types.RelayInfo)
+    CrawledRelays = make(map[string]bool)
+    OfflineRelays = make(map[string]bool)
+
+    foundRelaysCount = 0
+    crawledRelaysCount = 0
+    offlineRelaysCount = 0
+    RemainingRelaysCount = 0
+
+    log.Println("Relay data reset successfully.")
+}
 
 func IsLocalRelay(relayURL string) bool {
 	parsedURL, err := url.Parse(relayURL)
@@ -38,35 +79,8 @@ func IsOnionRelay(relayURL string) bool {
 	if err != nil {
 		return false
 	}
-	return strings.HasSuffix(parsedURL.Hostname(), ".onion")
+	return strings.Contains(parsedURL.Hostname(), ".onion")
 }
-
-// Update the status in the terminal
-func UpdateStatus() {
-	StatusMutex.Lock()
-	defer StatusMutex.Unlock()
-
-	// Remaining relays should be the number of found relays minus the crawled relays
-	RemainingRelaysCount = foundRelaysCount - crawledRelaysCount
-
-	fmt.Printf("\rFound Relays: %d | Crawled Relays: %d | Offline Relays: %d | Remaining Relays: %d",
-		foundRelaysCount, crawledRelaysCount, offlineRelaysCount, RemainingRelaysCount)
-}
-
-var (
-	Relays        = make(map[string]*types.RelayInfo)
-	RelaysMutex   sync.RWMutex
-	CrawledRelays = make(map[string]bool)  // Tracks which relays have been crawled
-	CrawledMutex  sync.RWMutex
-	OfflineRelays = make(map[string]bool)  // Tracks which relays are offline
-	OfflineMutex  sync.RWMutex
-)
-
-const (
-	maxRetries    = 1
-	retryDelay    = 2 * time.Second
-	timeout       = 2 * time.Second
-)
 
 // Exclude certain relay URLs (local, .onion, etc.)
 func shouldExcludeRelay(relayURL string) bool {
@@ -94,7 +108,7 @@ func markRelayOffline(relayURL string) {
 	log.Printf("Relay marked as offline: %s", relayURL)
 }
 
-// Initialize Crawling
+// Initialize the crawl process
 func Init(relayURL string, discoveredBy string, maxDepth int) {
 	if maxDepth <= 0 {
 		return
@@ -105,49 +119,86 @@ func Init(relayURL string, discoveredBy string, maxDepth int) {
 	// Check if the relay should be excluded
 	if shouldExcludeRelay(normalizedRelayURL) {
 		markRelayOffline(normalizedRelayURL)
-		StatusMutex.Lock()
-		offlineRelaysCount++ // Increment the offline count for excluded relays
-		StatusMutex.Unlock()
-		UpdateStatus()
 		return
 	}
 
-	// Check if the relay is offline
-	OfflineMutex.RLock()
-	if OfflineRelays[normalizedRelayURL] {
-		OfflineMutex.RUnlock()
-		return
-	}
-	OfflineMutex.RUnlock()
-
+	// Check if the relay has already been crawled
 	CrawledMutex.Lock()
 	if CrawledRelays[normalizedRelayURL] {
 		CrawledMutex.Unlock()
 		return
 	}
-	CrawledRelays[normalizedRelayURL] = true
-	crawledRelaysCount++ // Increment the counter for crawled relays
+	CrawledRelays[normalizedRelayURL] = true // Mark as crawled
+	crawledRelaysCount++                     // Increment crawled count
 	CrawledMutex.Unlock()
 
-	// Retry logic
+	// Retry mechanism for fetching the relay data
+	success := false
 	for retry := 0; retry < maxRetries; retry++ {
-		err := Fetch(normalizedRelayURL, discoveredBy)
+		err := Fetch(normalizedRelayURL, discoveredBy) // Fetch relay data
 		if err != nil {
-			if retry < maxRetries-1 {
-				time.Sleep(retryDelay)
-			}
+			log.Printf("Failed to fetch relay: %s (attempt %d/%d)", relayURL, retry+1, maxRetries)
+			time.Sleep(retryDelay) // Retry after delay
 		} else {
-			UpdateStatus() // Successfully crawled
-			return
+			success = true // Relay fetched successfully
+			break
 		}
 	}
 
-	// Mark as offline after all retries
-	markRelayOffline(normalizedRelayURL)
+	// Mark relay offline if all retries fail
+	if !success {
+		markRelayOffline(normalizedRelayURL)
+		offlineRelaysCount++ // Increment offline count
+	}
 
-	StatusMutex.Lock()
-	offlineRelaysCount++ // Increment the counter for offline relays after retries
-	StatusMutex.Unlock()
-
+	// Update the status after each crawl
 	UpdateStatus()
+}
+
+// Continue crawling based on uncrawled online relays
+func ContinueCrawl() {
+	for {
+		RelaysMutex.RLock()
+		remainingRelays := getUncrawledOnlineRelays()
+		RelaysMutex.RUnlock()
+
+		// If no uncrawled relays left, exit
+		if len(remainingRelays) == 0 {
+			log.Println("No remaining online relays to crawl.")
+			break
+		}
+
+		for _, relay := range remainingRelays {
+			go Init(relay.URL, relay.DiscoveredBy, 3)
+		}
+		time.Sleep(1 * time.Second) // Allow time for the next set of crawls
+	}
+}
+
+// Helper function to get uncrawled online relays
+func getUncrawledOnlineRelays() []*types.RelayInfo {
+	var uncrawled []*types.RelayInfo
+	for url, relay := range Relays {
+		// Skip if already crawled or should be excluded
+		CrawledMutex.RLock()
+		alreadyCrawled := CrawledRelays[url]
+		CrawledMutex.RUnlock()
+
+		if !alreadyCrawled && !shouldExcludeRelay(url) {
+			uncrawled = append(uncrawled, relay)
+		}
+	}
+	return uncrawled
+}
+
+// Update the status in the terminal
+func UpdateStatus() {
+	StatusMutex.Lock()
+	defer StatusMutex.Unlock()
+
+	// Remaining relays should be the number of found relays minus the crawled relays
+	RemainingRelaysCount = foundRelaysCount - crawledRelaysCount
+
+	fmt.Printf("\rFound Relays: %d | Crawled Relays: %d | Offline Relays: %d | Remaining Relays: %d",
+		foundRelaysCount, crawledRelaysCount, offlineRelaysCount, RemainingRelaysCount)
 }

@@ -15,6 +15,7 @@ func Parse(message []byte, initiatingRelay string) error {
 		return err
 	}
 
+	// Ensure this is an "EVENT" message
 	if len(response) < 3 || response[0] != "EVENT" {
 		return nil // Not an event message, ignore
 	}
@@ -29,6 +30,7 @@ func Parse(message []byte, initiatingRelay string) error {
 		return fmt.Errorf("invalid tags format")
 	}
 
+	// Process all relays in the tags
 	for _, tag := range tags {
 		tagArr, ok := tag.([]interface{})
 		if !ok || len(tagArr) < 2 || tagArr[0] != "r" {
@@ -40,14 +42,14 @@ func Parse(message []byte, initiatingRelay string) error {
 			continue
 		}
 
-		// Check if the relay should be excluded
+		// Skip relay if it should be excluded (onion, local relays)
 		if shouldExcludeRelay(relayURL) {
+			RelaysMutex.Lock()
 			markRelayOffline(relayURL)
-			StatusMutex.Lock()
-			offlineRelaysCount++ // Increment offline for excluded relays
-			StatusMutex.Unlock()
+			offlineRelaysCount++ // Increment offline count for excluded relays
+			RelaysMutex.Unlock()
 			UpdateStatus()
-			continue // Skip excluded relays
+			continue
 		}
 
 		// Skip non ws:// or wss:// protocols
@@ -55,6 +57,7 @@ func Parse(message []byte, initiatingRelay string) error {
 			continue
 		}
 
+		// Normalize the relay URL
 		parsedURL, err := url.Parse(relayURL)
 		if err != nil {
 			continue
@@ -62,9 +65,9 @@ func Parse(message []byte, initiatingRelay string) error {
 		relayURL = fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Hostname())
 
 		RelaysMutex.Lock()
-		_, exists := Relays[relayURL]
+		relayInfo, exists := Relays[relayURL]
 		if !exists {
-			// Increment found relays only when a new relay is found
+			// Increment found relays if it's new
 			foundRelaysCount++
 			Relays[relayURL] = &types.RelayInfo{
 				URL:          relayURL,
@@ -72,7 +75,8 @@ func Parse(message []byte, initiatingRelay string) error {
 				DiscoveredBy: initiatingRelay,
 			}
 		} else {
-			Relays[relayURL].Count++
+			// Increment the count of this relay if already exists
+			relayInfo.Count++
 		}
 		RelaysMutex.Unlock()
 
@@ -85,7 +89,7 @@ func Parse(message []byte, initiatingRelay string) error {
 
 		// If not crawled, attempt to crawl it
 		if !alreadyCrawled {
-			go Init(relayURL, initiatingRelay, 2) 
+			go Init(relayURL, initiatingRelay, 2)
 		}
 	}
 
