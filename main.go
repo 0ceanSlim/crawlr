@@ -19,7 +19,6 @@ import (
 const(
 	logFolder     = "logs/"
 	relayLogFile  = logFolder + "relays.csv"
-	writeInterval = 5 * time.Minute
 )
 
 func initLogging() {
@@ -73,96 +72,98 @@ func allOnlineRelaysCrawled() bool {
 	crawl.CrawledMutex.RLock()
 	defer crawl.CrawledMutex.RUnlock()
 
-	for relayURL := range crawl.Relays {
-		if !crawl.OfflineRelays[relayURL] && !crawl.CrawledRelays[relayURL] {
-			return false
-		}
-	}
-	return true
+	return crawl.RemainingRelaysCount == 0
 }
+
 
 func readRelaysFromCSV() []string {
-	file, err := os.Open(relayLogFile)
-	if err != nil {
-		log.Printf("Could not open CSV file: %v", err)
-		return nil
-	}
-	defer file.Close()
+    file, err := os.Open(relayLogFile)
+    if err != nil {
+        log.Printf("Could not open CSV file: %v", err)
+        return nil
+    }
+    defer file.Close()
 
-	reader := csv.NewReader(file)
-	records, err := reader.ReadAll()
-	if err != nil {
-		log.Printf("Could not read CSV file: %v", err)
-		return nil
-	}
+    reader := csv.NewReader(file)
+    records, err := reader.ReadAll()
+    if err != nil {
+        log.Printf("Could not read CSV file: %v", err)
+        return nil
+    }
 
-	var relays []string
-	for _, record := range records[1:] { // Skip header
-		if len(record) > 0 {
-			relays = append(relays, record[0]) // Use the relay URL
-		}
-	}
-	return relays
+    var onlineRelays []string
+    for _, record := range records[1:] { // Skip header
+        if len(record) > 0 {
+            relayURL := record[0]
+
+            // Check if the relay is offline
+            crawl.OfflineMutex.RLock()
+            offline := crawl.OfflineRelays[relayURL]
+            crawl.OfflineMutex.RUnlock()
+
+            // Only add online relays
+            if !offline {
+                onlineRelays = append(onlineRelays, relayURL)
+            }
+        }
+    }
+    return onlineRelays
 }
 
-func startPeriodicWrite() {
-	ticker := time.NewTicker(writeInterval)
-	go func() {
-		for range ticker.C {
-			writeToCSV()
-		}
-	}()
-}
 
 func main() {
-	initLogging()
-	startPeriodicWrite()
+    initLogging()
 
-	var wg sync.WaitGroup
-	crawlComplete := make(chan struct{})
+    var wg sync.WaitGroup
+    crawlComplete := make(chan struct{})
 
-	relaysFromCSV := readRelaysFromCSV()
-	if len(relaysFromCSV) > 0 {
-		log.Println("Starting crawl from relays in CSV...")
-		for _, relay := range relaysFromCSV {
-			wg.Add(1)
-			go func(r string) {
-				defer wg.Done()
-				crawl.CrawlRelay(r, r, 3)
-			}(relay)
-		}
-	} else {
-		startingRelay := "wss://nos.lol"
-		log.Println("No relays found in CSV. Starting from:", startingRelay)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			crawl.CrawlRelay(startingRelay, "starting-point", 3)
-		}()
-	}
+    // Read only online relays from CSV
+    relaysFromCSV := readRelaysFromCSV()
+    if len(relaysFromCSV) > 0 {
+        log.Println("Starting crawl from online relays in CSV...")
+        for _, relay := range relaysFromCSV {
+            wg.Add(1)
+            go func(r string) {
+                defer wg.Done()
+                crawl.Init(r, r, 3)
+            }(relay)
+        }
+    } else {
+        // If no online relays in CSV, start from a default relay
+        startingRelay := "wss://nos.lol"
+        log.Println("No online relays found in CSV. Starting from:", startingRelay)
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            crawl.Init(startingRelay, "starting-point", 3)
+        }()
+    }
 
-	go func() {
-		wg.Wait()
-		for {
-			if allOnlineRelaysCrawled() {
-				close(crawlComplete)
-				return
-			}
-			time.Sleep(1 * time.Second)
-		}
-	}()
+    // Wait for all crawls to complete
+    go func() {
+        wg.Wait()
+        for {
+            if allOnlineRelaysCrawled() {
+                close(crawlComplete)
+                return
+            }
+            time.Sleep(1 * time.Second)
+        }
+    }()
 
-	interrupt := make(chan os.Signal, 1)
-	signal.Notify(interrupt, os.Interrupt)
+    // Handle interrupt signal (Ctrl+C)
+    interrupt := make(chan os.Signal, 1)
+    signal.Notify(interrupt, os.Interrupt)
 
-	select {
-	case <-crawlComplete:
-		log.Println("Crawl complete. All online relays have been contacted.")
-	case <-interrupt:
-		log.Println("Received interrupt signal.")
-	}
+    select {
+    case <-crawlComplete:
+        log.Println("Crawl complete. All online relays have been contacted.")
+    case <-interrupt:
+        log.Println("Received interrupt signal.")
+    }
 
-	log.Println("Writing final results to CSV...")
-	writeToCSV()
-	log.Println("Final results written to", relayLogFile)
+    // Write the final results to CSV
+    log.Println("Writing final results to CSV...")
+    writeToCSV()
+    log.Println("Final results written to", relayLogFile)
 }

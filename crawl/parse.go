@@ -3,14 +3,13 @@ package crawl
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/url"
 	"strings"
 
 	"crawlr/types"
 )
 
-func parseRelayList(message []byte, initiatingRelay string) error {
+func Parse(message []byte, initiatingRelay string) error {
 	var response []interface{}
 	if err := json.Unmarshal(message, &response); err != nil {
 		return err
@@ -30,8 +29,6 @@ func parseRelayList(message []byte, initiatingRelay string) error {
 		return fmt.Errorf("invalid tags format")
 	}
 
-	var wsCount, wssCount, onionCount int
-
 	for _, tag := range tags {
 		tagArr, ok := tag.([]interface{})
 		if !ok || len(tagArr) < 2 || tagArr[0] != "r" {
@@ -43,59 +40,54 @@ func parseRelayList(message []byte, initiatingRelay string) error {
 			continue
 		}
 
-		// Count .onion sites
-		if strings.HasSuffix(relayURL, ".onion") {
-			onionCount++
-			continue
+		// Check if the relay should be excluded
+		if shouldExcludeRelay(relayURL) {
+			markRelayOffline(relayURL)
+			StatusMutex.Lock()
+			offlineRelaysCount++ // Increment offline for excluded relays
+			StatusMutex.Unlock()
+			UpdateStatus()
+			continue // Skip excluded relays
 		}
 
-		// Only process ws:// or wss:// URLs
+		// Skip non ws:// or wss:// protocols
 		if !strings.HasPrefix(relayURL, "ws://") && !strings.HasPrefix(relayURL, "wss://") {
 			continue
 		}
 
-		// Remove anything after the high-level domain
 		parsedURL, err := url.Parse(relayURL)
 		if err != nil {
 			continue
 		}
 		relayURL = fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Hostname())
 
-		// Count ws and wss relays
-		if strings.HasPrefix(relayURL, "ws://") {
-			wsCount++
-		} else if strings.HasPrefix(relayURL, "wss://") {
-			wssCount++
-		}
-
 		RelaysMutex.Lock()
-		relayInfo, exists := Relays[relayURL]
-		if exists {
-			relayInfo.Count++
-		} else {
-			relayInfo = &types.RelayInfo{
+		_, exists := Relays[relayURL]
+		if !exists {
+			// Increment found relays only when a new relay is found
+			foundRelaysCount++
+			Relays[relayURL] = &types.RelayInfo{
 				URL:          relayURL,
 				Count:        1,
 				DiscoveredBy: initiatingRelay,
 			}
-			Relays[relayURL] = relayInfo
+		} else {
+			Relays[relayURL].Count++
 		}
 		RelaysMutex.Unlock()
 
-		// Check if we've already crawled this relay
+		UpdateStatus()
+
+		// Check if the relay has already been crawled
 		CrawledMutex.Lock()
 		alreadyCrawled := CrawledRelays[relayURL]
 		CrawledMutex.Unlock()
 
+		// If not crawled, attempt to crawl it
 		if !alreadyCrawled {
-			go CrawlRelay(relayURL, initiatingRelay, 2)
+			go Init(relayURL, initiatingRelay, 2) 
 		}
-
-		log.Printf("Discovered relay: %s (Discovered by: %s, Count: %d)", relayURL, initiatingRelay, relayInfo.Count)
 	}
-
-	// Log the counts
-	log.Printf("Relay counts - WS: %d, WSS: %d, Onion: %d", wsCount, wssCount, onionCount)
 
 	return nil
 }
