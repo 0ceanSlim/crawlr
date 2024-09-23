@@ -178,7 +178,7 @@ func connectAndFetch(relayURL string, initiatingRelay string) error {
 	}
 	defer ws.Close()
 
-	subscriptionID := "relay-crawl-1"
+	subscriptionID := "crawlr"
 	req := []interface{}{
 		"REQ", subscriptionID, map[string]interface{}{
 			"kinds": []int{10002},
