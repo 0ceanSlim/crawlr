@@ -4,10 +4,12 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,20 +27,19 @@ const (
 	Malformed    RelayCategory = "malformed"
 )
 
-// Relay lists
+// Relay lists with mutex protection
 var (
-	clearOnline  = make(map[string]int)
-	clearOffline = make(map[string]int)
-	onion        = make(map[string]int)
-	local        = make(map[string]int)
-	malformed    = make(map[string]int)
+	mu            sync.Mutex
+	clearOnline   = make(map[string]int)
+	clearOffline  = make(map[string]int)
+	onion         = make(map[string]int)
+	local         = make(map[string]int)
+	malformed     = make(map[string]int)
+	crawledRelays = make(map[string]bool)
 )
 
 // Max tries for a relay before moving to the offline list
 const maxTries = 2
-
-// WebSocket timeout in seconds
-const wsTimeout = 2
 
 // ReqKind10002 sends a REQ message for kind 10002 events and parses relay URLs
 func ReqKind10002(relayURL string) error {
@@ -52,9 +53,6 @@ func ReqKind10002(relayURL string) error {
 		return fmt.Errorf("dial error: %v", err)
 	}
 	defer ws.Close()
-
-	// Set a timeout for receiving messages
-	ws.SetDeadline(time.Now().Add(wsTimeout * time.Second))
 
 	// Send REQ message
 	subscriptionID := "crawlr"
@@ -70,18 +68,34 @@ func ReqKind10002(relayURL string) error {
 		return fmt.Errorf("failed to send REQ message: %v", err)
 	}
 
-	// Receive and parse a single message
-	var msg []byte
-	err = websocket.Message.Receive(ws, &msg)
-	if err != nil {
-		return fmt.Errorf("receive error: %v", err)
-	}
-	fmt.Printf("Received message: %s\n", string(msg)) // Debugging
+	// Continuously receive messages until EOSE or connection closed
+	for {
+		var msg []byte
+		err = websocket.Message.Receive(ws, &msg)
+		if err != nil {
+			if err == io.EOF {
+				return nil // Connection closed normally
+			}
+			return fmt.Errorf("receive error: %v", err)
+		}
+		fmt.Printf("Received message: %s\n", string(msg)) // Debugging
 
-	if err := parseRelayList(msg); err != nil {
-		return err
-	}
+		// Parse the message to check if it's an EOSE message
+		var response []interface{}
+		if err := json.Unmarshal(msg, &response); err != nil {
+			fmt.Printf("Error parsing message: %v\n", err)
+			continue
+		}
 
+		if len(response) > 0 && response[0] == "EOSE" {
+			fmt.Println("Received EOSE, stopping reception from this relay.")
+			break
+		}
+
+		if err := parseRelayList(msg); err != nil {
+			fmt.Printf("Error parsing relay list: %v\n", err)
+		}
+	}
 	return nil
 }
 
@@ -107,6 +121,8 @@ func parseRelayList(message []byte) error {
 		return fmt.Errorf("invalid tags format")
 	}
 
+	relayURLs := make([]string, 0)
+
 	for _, tag := range tags {
 		tagArr, ok := tag.([]interface{})
 		if !ok || len(tagArr) < 2 || tagArr[0] != "r" {
@@ -117,9 +133,16 @@ func parseRelayList(message []byte) error {
 		if !ok {
 			continue
 		}
+		relayURLs = append(relayURLs, relayURL)
+	}
 
+	// Lock once for all relay classifications
+	mu.Lock()
+	defer mu.Unlock()
+	for _, relayURL := range relayURLs {
 		classifyRelay(relayURL)
 	}
+
 	return nil
 }
 
@@ -175,20 +198,48 @@ func isReservedIP(ip net.IP) bool {
 	return false
 }
 
-// Crawl the relays from the clearOnline list
-func crawlClearOnlineRelays() {
+// crawlClearOnlineRelays crawls the relays from the clearOnline list concurrently
+func crawlClearOnlineRelays(concurrency int) {
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+
+	mu.Lock()
+	relays := make([]string, 0, len(clearOnline))
 	for relay := range clearOnline {
-		for i := 0; i < maxTries; i++ {
-			err := ReqKind10002(relay)
-			if err != nil {
-				fmt.Printf("Failed to crawl relay %s: %v\n", relay, err)
-				clearOffline[relay] = clearOnline[relay]
-				delete(clearOnline, relay)
-			} else {
-				break
-			}
+		if !crawledRelays[relay] {
+			relays = append(relays, relay)
 		}
 	}
+	mu.Unlock()
+
+	for _, relay := range relays {
+		wg.Add(1)
+		sem <- struct{}{} // Block when reaching concurrency limit
+
+		go func(r string) {
+			defer wg.Done()
+			defer func() { <-sem }() // Release semaphore
+
+			for i := 0; i < maxTries; i++ {
+				err := ReqKind10002(r)
+				if err != nil {
+					fmt.Printf("Failed to crawl relay %s: %v\n", r, err)
+
+					mu.Lock()
+					clearOffline[r] = clearOnline[r]
+					delete(clearOnline, r)
+					mu.Unlock()
+				} else {
+					mu.Lock()
+					crawledRelays[r] = true
+					mu.Unlock()
+					break
+				}
+			}
+		}(relay)
+	}
+
+	wg.Wait()
 }
 
 // Export discovered relays to CSV
@@ -227,42 +278,39 @@ func finalize() {
 }
 
 func main() {
-	// Create a channel to capture OS signals
 	exitSignal := make(chan os.Signal, 1)
 	signal.Notify(exitSignal, os.Interrupt, syscall.SIGTERM)
 
-	// Run the crawling process in a separate goroutine
 	go func() {
 		initialRelay := "wss://nos.lol"
+		concurrency := 10 // Adjust this value based on your needs and system capabilities
 
 		for {
-			// Start crawl from initial relay
 			err := ReqKind10002(initialRelay)
 			if err != nil {
 				fmt.Printf("Initial crawl failed: %v\n", err)
 			}
 
-			// Crawl discovered clearOnline relays
-			crawlClearOnlineRelays()
+			crawlClearOnlineRelays(concurrency)
 
-			// Sleep for a while before retrying (e.g., 30 seconds)
-			time.Sleep(2 * time.Second)
+			mu.Lock()
+			fmt.Printf("Discovered relays: %d\n", len(clearOnline))
+			remainingRelays := len(clearOnline) - len(crawledRelays)
+			mu.Unlock()
 
-			// Check if there are any more relays left to crawl
-			if len(clearOnline) == 0 {
-				fmt.Println("No more relays to crawl. Exiting...")
-				break
+			if remainingRelays == 0 {
+				fmt.Println("No more relays to crawl. Waiting for new relays...")
+				time.Sleep(30 * time.Second) // Wait before retrying
+				continue
 			}
-		}
 
-		// Finalize and write CSVs after crawling is complete
-		finalize()
+			time.Sleep(2 * time.Second)
+		}
 	}()
 
 	// Wait for an exit signal (Ctrl+C or kill)
 	<-exitSignal
 
-	// Finalize and write CSVs when the program is interrupted
 	fmt.Println("\nReceived exit signal, writing logs and exiting...")
 	finalize()
 }
