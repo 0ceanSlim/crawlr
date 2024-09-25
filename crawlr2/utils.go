@@ -4,45 +4,71 @@ import (
 	"encoding/csv"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 )
 
 // classifyRelay categorizes the relay URL into the appropriate list
 func classifyRelay(relayURL string) {
-	if isMalformedRelay(relayURL) {
-		malformed[relayURL]++
-	} else if isLocalRelay(relayURL) {
-		local[relayURL]++
-	} else if isOnionRelay(relayURL) {
-		onion[relayURL]++
+	// Normalize the URL to ensure consistent categorization
+	normalizedURL := normalizeURL(relayURL)
+
+	if isMalformedRelay(normalizedURL) {
+		malformed[normalizedURL]++
+	} else if isLocalRelay(normalizedURL) {
+		local[normalizedURL]++
+	} else if isOnionRelay(normalizedURL) {
+		onion[normalizedURL]++
 	} else {
-		clearOnline[relayURL]++
+		clearOnline[normalizedURL]++
 	}
 }
 
-// Helper functions to categorize relays
-func isMalformedRelay(url string) bool {
-	return !strings.HasPrefix(url, "ws://") && !strings.HasPrefix(url, "wss://")
+// normalizeURL strips trailing slashes and converts the URL to lowercase for comparison
+func normalizeURL(url string) string {
+	url = strings.TrimRight(url, "/")
+	return strings.ToLower(url)
 }
 
-func isLocalRelay(url string) bool {
-	host := extractHost(url)
+// isMalformedRelay checks if the URL is malformed
+func isMalformedRelay(urlStr string) bool {
+	// Check if the URL starts with a quote or other invalid character
+	if strings.HasPrefix(urlStr, `"`) || (!strings.HasPrefix(urlStr, "ws://") && !strings.HasPrefix(urlStr, "wss://")) {
+		return true
+	}
+
+	// Attempt to parse the URL to check if it's valid
+	_, err := url.Parse(urlStr)
+	return err != nil
+}
+
+// isLocalRelay checks if the URL contains a private/local IP
+func isLocalRelay(urlStr string) bool {
+	host := extractHost(urlStr)
 	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback() || isReservedIP(ip)
+
+	if ip == nil {
+		return false
+	}
+
+	// Check if the IP is loopback or within the reserved ranges
+	return ip.IsLoopback() || isReservedIP(ip)
 }
 
-func isOnionRelay(url string) bool {
-	return strings.HasSuffix(extractHost(url), ".onion")
+// isOnionRelay checks if the URL points to a .onion address
+func isOnionRelay(urlStr string) bool {
+	host := extractHost(urlStr)
+	return strings.HasSuffix(host, ".onion")
 }
 
 // extractHost extracts the host part from the URL
-func extractHost(url string) string {
-	parts := strings.Split(url, "/")
-	if len(parts) >= 3 {
-		return parts[2]
+func extractHost(urlStr string) string {
+	parsedURL, err := url.Parse(urlStr)
+	if err != nil {
+		return ""
 	}
-	return ""
+	return parsedURL.Hostname()
 }
 
 // isReservedIP checks if the IP address is in a reserved range
@@ -59,8 +85,6 @@ func isReservedIP(ip net.IP) bool {
 	}
 	return false
 }
-
-
 
 // Export discovered relays to CSV
 func exportToCSV(category RelayCategory, relayList map[string]int) {
