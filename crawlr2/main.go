@@ -14,7 +14,7 @@ func main() {
 
 	go func() {
 		initialRelay := "wss://nos.lol"
-		concurrency := 10 // Adjust this value based on your needs and system capabilities
+		concurrency := 50 // Adjust this value based on your needs and system capabilities
 
 		for {
 			err := ReqKind10002(initialRelay)
