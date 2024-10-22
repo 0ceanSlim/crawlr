@@ -12,4 +12,5 @@ var (
 	local         = make(map[string]int)
 	malformed     = make(map[string]int)
 	crawledRelays = make(map[string]bool)
+	logChannel    = make(chan string, 100)
 )

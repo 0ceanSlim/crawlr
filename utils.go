@@ -10,24 +10,6 @@ import (
 	"strings"
 )
 
-// classifyRelay categorizes the relay URL into the appropriate list
-func classifyRelay(relayURL string) {
-	// Normalize the URL to ensure consistent categorization
-	normalizedURL := normalizeURL(relayURL)
-
-	if isMalformedRelay(normalizedURL) {
-		malformed[normalizedURL]++
-	} else if isLocalRelay(normalizedURL) {
-		local[normalizedURL]++
-	} else if isOnionRelay(normalizedURL) {
-		onion[normalizedURL]++
-	} else if isAPIRelay(normalizedURL) {
-		clearAPI[normalizedURL]++
-	} else {
-		clearOnline[normalizedURL]++
-	}
-}
-
 // normalizeURL strips trailing slashes and converts the URL to lowercase for comparison
 func normalizeURL(url string) string {
 	url = strings.TrimRight(url, "/")
@@ -149,13 +131,13 @@ func isReservedIP(ip net.IP) bool {
 func exportToCSV(category RelayCategory, relayList map[string]int) {
 	// Ensure logs directory exists
 	if err := os.MkdirAll("logs", os.ModePerm); err != nil {
-		fmt.Printf("Failed to create logs directory: %v\n", err)
+		//fmt.Printf("Failed to create logs directory: %v\n", err)
 		return
 	}
 
 	file, err := os.Create(fmt.Sprintf("logs/%s_relays.csv", category))
 	if err != nil {
-		fmt.Printf("Failed to create CSV file for %s: %v\n", category, err)
+		//fmt.Printf("Failed to create CSV file for %s: %v\n", category, err)
 		return
 	}
 	defer file.Close()

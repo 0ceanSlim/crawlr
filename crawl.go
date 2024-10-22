@@ -1,16 +1,22 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"golang.org/x/net/websocket"
 )
 
 // ReqKind10002 sends a REQ message for kind 10002 events and parses relay URLs
 func ReqKind10002(relayURL string) error {
+	// Set a timeout for the entire operation (e.g., 10 seconds)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
 	config, err := websocket.NewConfig(relayURL, "http://localhost/")
 	if err != nil {
 		return fmt.Errorf("config error: %v", err)
@@ -38,34 +44,36 @@ func ReqKind10002(relayURL string) error {
 
 	// Continuously receive messages until EOSE or connection closed
 	for {
-		var msg []byte
-		err = websocket.Message.Receive(ws, &msg)
-		if err != nil {
-			if err == io.EOF {
-				return nil // Connection closed normally
+		select {
+		case <-ctx.Done():
+			// Timeout case
+			return fmt.Errorf("timeout: no response from relay")
+		default:
+			var msg []byte
+			err = websocket.Message.Receive(ws, &msg)
+			if err != nil {
+				if err == io.EOF {
+					return nil // Connection closed normally
+				}
+				return fmt.Errorf("receive error: %v", err)
 			}
-			return fmt.Errorf("receive error: %v", err)
-		}
-		fmt.Printf("Received message: %s\n", string(msg)) // Debugging
 
-		// Parse the message to check if it's an EOSE message
-		var response []interface{}
-		if err := json.Unmarshal(msg, &response); err != nil {
-			fmt.Printf("Error parsing message: %v\n", err)
-			continue
-		}
+			var response []interface{}
+			if err := json.Unmarshal(msg, &response); err != nil {
+				continue
+			}
 
-		if len(response) > 0 && response[0] == "EOSE" {
-			fmt.Println("Received EOSE, stopping reception from this relay.")
-			break
-		}
+			if len(response) > 0 && response[0] == "EOSE" {
+				return nil // EOSE received, return successfully here
+			}
 
-		if err := parseRelayList(msg); err != nil {
-			fmt.Printf("Error parsing relay list: %v\n", err)
+			if err := parseRelayList(msg); err != nil {
+				logChannel <- fmt.Sprintf("Error parsing relay list: %v", err)
+			}
 		}
 	}
-	return nil
 }
+
 
 // parseRelayList parses relay URLs from kind 10002 messages
 func parseRelayList(message []byte) error {
@@ -74,7 +82,6 @@ func parseRelayList(message []byte) error {
 		return fmt.Errorf("failed to parse message: %v", err)
 	}
 
-	// Ensure it's an "EVENT" message
 	if len(response) < 3 || response[0] != "EVENT" {
 		return nil
 	}
@@ -104,7 +111,6 @@ func parseRelayList(message []byte) error {
 		relayURLs = append(relayURLs, relayURL)
 	}
 
-	// Lock once for all relay classifications
 	mu.Lock()
 	defer mu.Unlock()
 	for _, relayURL := range relayURLs {
@@ -112,6 +118,23 @@ func parseRelayList(message []byte) error {
 	}
 
 	return nil
+}
+
+// classifyRelay categorizes the relay URL into the appropriate list
+func classifyRelay(relayURL string) {
+	normalizedURL := normalizeURL(relayURL)
+
+	if isMalformedRelay(normalizedURL) {
+		malformed[normalizedURL]++
+	} else if isLocalRelay(normalizedURL) {
+		local[normalizedURL]++
+	} else if isOnionRelay(normalizedURL) {
+		onion[normalizedURL]++
+	} else if isAPIRelay(normalizedURL) {
+		clearAPI[normalizedURL]++
+	} else {
+		clearOnline[normalizedURL]++
+	}
 }
 
 // crawlClearOnlineRelays crawls the relays from the clearOnline list concurrently
@@ -139,21 +162,38 @@ func crawlClearOnlineRelays(concurrency int) {
 			for i := 0; i < maxTries; i++ {
 				err := ReqKind10002(r)
 				if err != nil {
-					fmt.Printf("Failed to crawl relay %s: %v\n", r, err)
+					logChannel <- fmt.Sprintf("Failed to crawl relay %s: %v", r, err)
 
 					mu.Lock()
 					clearOffline[r] = clearOnline[r]
 					delete(clearOnline, r)
 					mu.Unlock()
 				} else {
+					logChannel <- fmt.Sprintf("Successfully crawled relay: %s", r)
+
 					mu.Lock()
 					crawledRelays[r] = true
 					mu.Unlock()
 					break
 				}
+
+				// If we've exhausted all attempts, mark it as crawled even if it's offline
+				if i == maxTries-1 {
+					mu.Lock()
+					crawledRelays[r] = true // Mark as crawled after max tries
+					mu.Unlock()
+				}
 			}
 		}(relay)
 	}
 
-	wg.Wait()
+	wg.Wait() // Wait for all goroutines to finish
+}
+
+// Logger that prints messages without affecting the status bar
+func logRelayEvents() {
+	for msg := range logChannel {
+		// Move the cursor up to print above the status bar
+		fmt.Printf("\033[F%s\n", msg)
+	}
 }
