@@ -30,7 +30,7 @@ func updateProgress() {
 		}
 
 		// Print the status at the bottom
-		screen, _ := ts.GetSize() // Get terminal size to dynamically adjust progress bar width
+		screen, _ := ts.GetSize()     // Get terminal size to dynamically adjust progress bar width
 		barWidth := screen.Col() - 30 // Adjust width for bar
 		progressBar := generateProgressBar(int(progress), barWidth)
 
