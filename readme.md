@@ -1,3 +1,5 @@
+# crawlr will be deprecated in light of [NIP66](https://github.com/nostr-protocol/nips/pull/230). Maybe this will change to a monitor written in GO instead. Dead for now. 
+
 # crawlr 🕷️
 
 I crawl nostr relays
